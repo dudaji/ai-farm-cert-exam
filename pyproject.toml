@@ -1,0 +1,15 @@
+[project]
+name = "benchmark"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "sacrebleu",
+    "datasets",
+    "transformers",
+    "pillow",
+    "furiosa-smi-py",
+    "furiosa-llm",
+    "setuptools>=79.0.1",
+    "wheel>=0.45.1",
+]
+
