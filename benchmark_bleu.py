@@ -2,7 +2,7 @@ import argparse
 import json
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -11,8 +11,9 @@ from tqdm import tqdm
 
 # --- Constants ---
 MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-NUM_SAMPLES = 1000
-CONCURRENT_WORKERS = 100
+NUM_SAMPLES = 10000
+REQUEST_RATE = 16
+
 TRANSLATE_BASE_URL = "http://localhost:8000"
 TRANSLATE_URL = f"{TRANSLATE_BASE_URL}/v1/chat/completions"
 HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -150,58 +151,120 @@ def translate_prompt(user_prompt: str, src_lang: str, tgt_lang: str) -> Dict[str
 
 
 def evaluate_language_pair(
-    json_filepath: str, src_lang: str, tgt_lang: str, output_path: Optional[str] = None
+    json_filepath: str,
+    src_lang: str,
+    tgt_lang: str,
+    output_path: Optional[str] = None,
+    request_rate_rps: Optional[float] = None,
+    max_in_flight: Optional[int] = None,
 ):
+    """
+    vLLM의 --request-rate 처럼 '오픈루프'로 요청을 내보내며 평가 수행.
+    - request_rate_rps: 초당 평균 요청 수(RPS). 지수분포 간격으로 제출.
+    - max_in_flight: 동시에 진행 중인(응답 대기) 요청 상한. (백프레셔 방지)
+    """
     pair = f"{src_lang}-{tgt_lang}"
 
-    # 1) ShareGPT JSON 로드 (ref 존재 가정 + 검증)
+    # 1) ShareGPT JSON 로드
     user_prompts, ref_texts = load_data_from_json(json_filepath)
     if NUM_SAMPLES and len(user_prompts) > NUM_SAMPLES:
         user_prompts = user_prompts[:NUM_SAMPLES]
         ref_texts = ref_texts[:NUM_SAMPLES]
 
     n = len(user_prompts)
+
+    # --- RPS/동시 진행 상한 설정 ---
+    if request_rate_rps is None:
+        request_rate_rps = float(REQUEST_RATE)  # 기존 상수의 의미를 RPS로 사용
+    if request_rate_rps <= 0:
+        raise ValueError("request_rate_rps must be > 0")
+    if max_in_flight is None:
+        # 평균 지연시간을 모를 때 보수적으로 RPS * 16 (+여유) 권장
+        max_in_flight = max(128, int(request_rate_rps * 16))
+
+    # 스레드 풀 크기 힌트: in-flight 처리량을 커버하도록 설정
+    max_workers = max(16, min(max_in_flight, int(request_rate_rps * 8)))
     print(
-        f"Evaluating {pair} on {n} samples with {CONCURRENT_WORKERS} concurrent workers..."
+        f"Evaluating {pair} on {n} samples "
+        f"with ~{request_rate_rps:.2f} req/s (open-loop) and max_in_flight={max_in_flight}..."
     )
 
-    # 결과 수집 버퍼
+    # 결과 버퍼
     predictions: List[str] = [""] * n
     latencies: List[Optional[float]] = [None] * n
     statuses: List[Optional[int]] = [None] * n
     errors: List[str] = [""] * n
-    usages: List[Dict[str, Any]] = [{}] * n
+    usages: List[Dict[str, Any]] = [{} for _ in range(n)]
 
-    # 2) 병렬 번역 + 완료 시마다 로그 출력
-    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
-        future_to_index = {
-            executor.submit(translate_prompt, prompt, src_lang, tgt_lang): i
-            for i, prompt in enumerate(user_prompts)
-        }
+    submitted = 0
+    completed = 0
 
-        progress = tqdm(
-            as_completed(future_to_index),
-            total=n,
-            desc=f"Translating {pair}",
-        )
-        for future in progress:
-            index = future_to_index[future]
-            try:
-                result = future.result()
-                predictions[index] = result["translation"]
-                latencies[index] = result["latency_sec"]
-                statuses[index] = result["status_code"]
-                errors[index] = result["error"]
-                usages[index] = result["usage"] or {}
-            except Exception as e:
-                # 이 경우엔 future 자체 실패
-                predictions[index] = ""
-                latencies[index] = None
-                statuses[index] = None
-                errors[index] = f"worker-exception: {e}"
-                usages[index] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        inflight = set()
+        future_to_index: Dict[Any, int] = {}
 
-    # 3) BLEU 계산 (ref 존재 가정)
+        # 첫 제출 시각
+        next_dispatch_at = time.perf_counter()
+
+        pbar = tqdm(total=n, desc=f"Translating {pair}")
+
+        while completed < n:
+            now = time.perf_counter()
+
+            # 가능한 한, RPS에 맞춰 제출 (open-loop). in-flight 상한도 준수.
+            while (
+                submitted < n
+                and len(inflight) < max_in_flight
+                and now >= next_dispatch_at
+            ):
+                f = executor.submit(
+                    translate_prompt, user_prompts[submitted], src_lang, tgt_lang
+                )
+                future_to_index[f] = submitted
+                inflight.add(f)
+                submitted += 1
+
+                # 다음 도착 간격: 지수분포(포아송 프로세스)로 페이싱
+                # random.expovariate(lambda) 의 평균은 1/lambda
+                interval = random.expovariate(request_rate_rps)
+                next_dispatch_at = now + interval
+                now = time.perf_counter()  # 루프 내 제출 지연 보정
+
+            # 완료된 작업 수거
+            if inflight:
+                # 다음 제출까지 남은 시간 또는 짧은 타임아웃으로 wait
+                timeout = max(0.0, next_dispatch_at - time.perf_counter()) if submitted < n and len(inflight) < max_in_flight else 0.05
+                done, _ = wait(inflight, timeout=timeout, return_when=FIRST_COMPLETED)
+            else:
+                # 아직 제출해야 할 게 있다면 다음 디스패치 시각까지 슬립
+                if submitted < n:
+                    sleep_for = max(0.0, next_dispatch_at - time.perf_counter())
+                    if sleep_for > 0:
+                        time.sleep(min(sleep_for, 0.05))
+                done = set()
+
+            for f in done:
+                idx = future_to_index.pop(f)
+                inflight.remove(f)
+                try:
+                    result = f.result()
+                    predictions[idx] = result["translation"]
+                    latencies[idx] = result["latency_sec"]
+                    statuses[idx] = result["status_code"]
+                    errors[idx] = result["error"]
+                    usages[idx] = result["usage"] or {}
+                except Exception as e:
+                    predictions[idx] = ""
+                    latencies[idx] = None
+                    statuses[idx] = None
+                    errors[idx] = f"worker-exception: {e}"
+                    usages[idx] = {}
+                completed += 1
+                pbar.update(1)
+
+        pbar.close()
+
+    # 3) BLEU 계산
     valid_preds = [p for p in predictions if p]
     valid_refs = [r for p, r in zip(predictions, ref_texts) if p]
     sentence_bleus = []
@@ -220,7 +283,7 @@ def evaluate_language_pair(
             "note": "No valid predictions; BLEU not computed.",
         }
 
-    # 4) JSON 결과 저장 (BLEU 메트릭 포함)
+    # 4) JSON 결과 저장
     results_data = [
         {
             "index": i,
@@ -242,6 +305,8 @@ def evaluate_language_pair(
         "pair": pair,
         "num_samples": n,
         "metrics": metrics,
+        "request_rate_rps": request_rate_rps,
+        "max_in_flight": max_in_flight,
         "results": results_data,
     }
     json_out = output_path if output_path else f"translation_results_{pair}.json"
@@ -265,10 +330,35 @@ def main():
         "--output",
         help="Output JSON filepath (default: translation_results_{src}-{tgt}.json)",
     )
+    parser.add_argument(
+        "--request-rate",
+        type=float,
+        default=None,
+        help=(
+            "Average requests per second (RPS), open-loop like vLLM --request-rate. "
+            "Default: use CONCURRENT_WORKERS constant value."
+        ),
+    )
+    parser.add_argument(
+        "--max-in-flight",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of in-flight requests. "
+            "Default: max(128, int(16*RPS))"
+        ),
+    )
     args = parser.parse_args()
 
     t0 = time.time()
-    evaluate_language_pair(args.input, args.src, args.tgt, args.output)
+    evaluate_language_pair(
+        args.input,
+        args.src,
+        args.tgt,
+        args.output,
+        request_rate_rps=args.request_rate,
+        max_in_flight=args.max_in_flight,
+    )
     print(f"Total execution time: {time.time() - t0:.2f} seconds")
 
 

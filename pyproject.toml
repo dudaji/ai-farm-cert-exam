@@ -11,5 +11,6 @@ dependencies = [
     "furiosa-llm",
     "setuptools>=79.0.1",
     "wheel>=0.45.1",
+    "matplotlib>=3.10.6",
 ]
 
