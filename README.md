@@ -37,7 +37,7 @@ git clone https://github.com/furiosa-ai/vllm.git -b add_power_monitor
     vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192
     ```
 
-## TPS, TPS/W
+## TPS, TPS/W, BLEU
 - npu
 ```bash
 ./script-tpsw-npu.sh <result_suffix>
@@ -46,10 +46,4 @@ git clone https://github.com/furiosa-ai/vllm.git -b add_power_monitor
 - gpu
 ```bash
 ./script-tpsw-gpu.sh <result_suffix>
-```
-
-## BLEU
-- npu, gpu
-```bash
-./script-bleu.sh <result_suffix>
 ```

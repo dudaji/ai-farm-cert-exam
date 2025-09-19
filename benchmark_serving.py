@@ -27,7 +27,10 @@ import gc
 import json
 import os
 import random
+import re
+import sys
 import time
+import traceback
 import warnings
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
@@ -35,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from multiprocessing import Process, Queue
 from typing import Any, Optional
 
+import aiohttp
 import numpy as np
 from backend_request_func import (
     ASYNC_REQUEST_FUNCS,
@@ -42,6 +46,7 @@ from backend_request_func import (
     RequestFuncInput,
     RequestFuncOutput,
 )
+from sacrebleu import corpus_bleu, sentence_bleu
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -78,7 +83,41 @@ from monitor_power import calculate_avg_power_usage, monitor_npu_power_usage
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 RESULT_DIR = ""
+INPUT_FILE_PATH = ""
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+_VI_BLOCK_RE = re.compile(r"vi\s*:\s*(.+?)(?:\r?\n\s*en\s*:|$)", re.IGNORECASE | re.DOTALL)
+
+def _extract_vi(text: str) -> str:
+    m = _VI_BLOCK_RE.search(text or "")
+    if not m:
+        return ""
+    # 공백 정규화
+    return " ".join(m.group(1).strip().split())
+
+def _get_req_vi(req) -> str:
+    # 흔한 필드들에서 먼저 시도
+    for attr in ("prompt_text", "prompt", "text", "user_message", "input_text"):
+        val = getattr(req, attr, None)
+        if isinstance(val, str):
+            vi = _extract_vi(val)
+            if vi:
+                return vi
+    # messages 형태 지원 (OpenAI 스타일)
+    msgs = getattr(req, "messages", None)
+    if isinstance(msgs, list):
+        for m in msgs:
+            if isinstance(m, dict):
+                vi = _extract_vi(m.get("content", ""))
+                if vi:
+                    return vi
+            elif isinstance(m, str):
+                vi = _extract_vi(m)
+                if vi:
+                    return vi
+    return ""
 
 @dataclass
 class BenchmarkMetrics:
@@ -113,6 +152,7 @@ class BenchmarkMetrics:
     median_power_consumption: float
     std_power_consumption: float
     percentiles_power_consumption: list[tuple[float, float]]
+    bleu: float
 
 
 async def get_request(
@@ -159,6 +199,107 @@ async def get_request(
         await asyncio.sleep(interval)
 
 
+async def async_request_openai_completions(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+    assert api_url.endswith(
+        ("completions", "profile")
+    ), "OpenAI Completions API URL must end with 'completions' or 'profile'."
+
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        payload = {
+            "model": request_func_input.model_name \
+                if request_func_input.model_name else request_func_input.model,
+            "prompt": request_func_input.prompt,
+            "temperature": 0.3,
+            "max_tokens": request_func_input.output_len,
+            # "logprobs": request_func_input.logprobs,
+            "stream": True,
+            "stream_options": {
+                "include_usage": True,
+            },
+        }
+        if request_func_input.ignore_eos:
+            payload["ignore_eos"] = request_func_input.ignore_eos
+        if request_func_input.extra_body:
+            payload.update(request_func_input.extra_body)
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"
+        }
+
+        output = RequestFuncOutput()
+        output.prompt_len = request_func_input.prompt_len
+        output.prompt = request_func_input.prompt
+        output.initiated_timestamp = datetime.now(timezone.utc)
+        
+        generated_text = ""
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        try:
+            async with session.post(url=api_url, json=payload,
+                                    headers=headers) as response:
+                if response.status == 200:
+                    first_chunk_received = False
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = chunk_bytes.decode("utf-8").removeprefix(
+                            "data: ")
+                        if chunk != "[DONE]":
+                            data = json.loads(chunk)
+
+                            # NOTE: Some completion API might have a last
+                            # usage summary response without a token so we
+                            # want to check a token was generated
+                            if choices := data.get("choices"):
+                                # Note that text could be empty here
+                                # e.g. for special tokens
+                                text = choices[0].get("text")
+                                timestamp = time.perf_counter()
+                                # First token
+                                if not first_chunk_received:
+                                    first_chunk_received = True
+                                    ttft = time.perf_counter() - st
+                                    output.ttft = ttft
+
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp -
+                                                      most_recent_timestamp)
+
+                                most_recent_timestamp = timestamp
+                                generated_text += text or ""
+                            elif usage := data.get("usage"):
+                                output.output_tokens = usage.get(
+                                    "completion_tokens")
+                    if first_chunk_received:
+                        output.success = True
+                    else:
+                        output.success = False
+                        output.error = (
+                            "Never received a valid chunk to calculate TTFT."
+                            "This response will be marked as failed!")
+                    output.generated_text = generated_text
+                    output.latency = most_recent_timestamp - st
+                    output.completed_timestamp = datetime.now(timezone.utc)
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 def calculate_metrics(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
@@ -183,6 +324,22 @@ def calculate_metrics(
     per_req_output_lens: list[int] = []
     per_req_latencies: list[float] = []   # seconds
     per_req_token_thput: list[float] = [] # tokens/sec = (input+output)/latency
+    per_req_bleu: list[float] = []
+    
+    ref_map: dict[str, str] = {}
+    try:
+        with open(INPUT_FILE_PATH, "r", encoding="utf-8") as f:
+            _ds = json.load(f)
+        for ex in _ds:
+            convs = ex.get("conversations", [])
+            user_val = next((c.get("value", "") for c in convs if c.get("from") == "user"), "")
+            ref_val = next((c.get("value", "") for c in convs if c.get("from") == "assistant"), "")
+            vi_src = _extract_vi(user_val)
+            if vi_src and ref_val:
+                # 중복 VI가 있을 수 있어 최초 항목을 유지
+                ref_map.setdefault(vi_src, ref_val)
+    except Exception as e:
+        warnings.warn(f"Failed to build ref_map for BLEU: {e}", stacklevel=2)
     
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -216,8 +373,22 @@ def calculate_metrics(
             per_req_output_lens.append(output_len)
             per_req_latencies.append(outputs[i].latency)
             per_req_token_thput.append(((in_len + output_len) / outputs[i].latency) if outputs[i].latency > 0 else float("nan"))
+            
+            # BLEU
+            src_vi = _get_req_vi(input_requests[i])
+            ref = ref_map.get(src_vi, "")
+            hyp = (outputs[i].generated_text or "").strip()
+            # print("ref", ref)
+            # print("result", hyp)
+            try:
+                bleu_i = float(sentence_bleu(hyp, [ref]).score) if ref else float("nan")
+            except Exception:
+                bleu_i = float("nan")
+            # print("bleu", bleu_i)
+            per_req_bleu.append(bleu_i)
         else:
             actual_output_lens.append(0)
+            per_req_bleu.append(float("nan"))
 
     if goodput_config_dict:
         valid_metrics = []
@@ -247,6 +418,20 @@ def calculate_metrics(
             "on the benchmark arguments.",
             stacklevel=2)
         
+    # BLEU
+    _sys, _ref = [], []
+    for i, out in enumerate(outputs):
+        if out.success:
+            src_vi = _get_req_vi(input_requests[i])
+            ref = ref_map.get(src_vi, "")
+            if ref:
+                _sys.append((out.generated_text or "").strip())
+                _ref.append(ref.strip())
+
+    try:
+        bleu_corpus = float(corpus_bleu(_sys, [_ref]).score) if _sys else 0.0
+    except Exception:
+        bleu_corpus = 0.0
 
     metrics = BenchmarkMetrics(
         completed=completed,
@@ -283,6 +468,7 @@ def calculate_metrics(
         percentiles_power_consumption=[
             (p, np.percentile(power_consumptions or 0, p)) for p in selected_percentiles
         ],
+        bleu=bleu_corpus,
     )
     
     try:
@@ -301,6 +487,7 @@ def calculate_metrics(
                 "latency_ms": (float(lat_s) * 1000.0) if isinstance(lat_s, (int, float)) else None,
                 # TPS = per-request tokens/sec = (input+output)/latency
                 "tps_tokens_per_sec": float(tps) if isinstance(tps, (int, float)) else None,
+                "bleu": (float(per_req_bleu[idx]) if per_req_bleu and idx < len(per_req_bleu) else None),
                 "success": outputs[idx].success,
             }
             records.append(rec)
@@ -315,6 +502,7 @@ def calculate_metrics(
             "output_len_tokens",
             "latency_ms",
             "tps_tokens_per_sec",
+            "bleu",
             "success",
         ]
         with open(per_request_csv_path, "w", encoding="utf-8", newline="") as f:
@@ -493,7 +681,7 @@ async def benchmark(
     enable_device_monitor: Optional[str] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
-        request_func = ASYNC_REQUEST_FUNCS[backend]
+        request_func = async_request_openai_completions
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -675,6 +863,8 @@ async def benchmark(
                                     metrics.output_throughput))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
+    print("{:<40} {:<10.2f}".format("BLEU score:",
+                                    metrics.bleu))
 
     result = {
         "duration": benchmark_duration,
@@ -982,8 +1172,9 @@ def main(args: argparse.Namespace):
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
     
-    global RESULT_DIR
+    global RESULT_DIR, INPUT_FILE_PATH
     RESULT_DIR = args.result_dir
+    INPUT_FILE_PATH = args.dataset_path
 
     if args.base_url is not None:
         api_url = f"{args.base_url}{args.endpoint}"
